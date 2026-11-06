@@ -3,213 +3,407 @@ import { chromium } from "playwright";
 import fs from "node:fs/promises";
 import path from "node:path";
 import readline from "node:readline/promises";
-import 'dotenv/config';
-
-const COURSE_ID = process.env.COURSE_ID;
-const ARCHIVE_DIR = process.env.ARCHIVE_DIR;
-
-if (!COURSE_ID || !/^\d+$/.test(COURSE_ID) || !ARCHIVE_DIR) {
-    throw new Error("Set COURSE_ID and ARCHIVE_DIR.");
-}
 
 const BASE_URL = "https://webcourses.ucf.edu";
-const FILES_URL = `${BASE_URL}/courses/${COURSE_ID}/files`;
+const ARCHIVE_DIR = process.env.ARCHIVE_DIR;
+const DOWNLOAD_ALL = process.env.DOWNLOAD_ALL === "true";
+
+const DOWNLOAD_DELAY_MS = 1500;
+const MAX_RETRIES = 3;
+
+if (!ARCHIVE_DIR) {
+  throw new Error("Set ARCHIVE_DIR before running.");
+}
 
 await fs.mkdir(ARCHIVE_DIR, { recursive: true });
 
 const browser = await chromium.launch({
-    headless: false,
+  headless: false,
 });
 
 const context = await browser.newContext({
-    acceptDownloads: true,
+  acceptDownloads: true,
 });
 
 const page = await context.newPage();
 
-const visitedFolders = new Set();
-const downloadedFiles = new Set();
-
 const report = {
-    downloaded: [],
-    skipped: [],
-    failed: [],
-    folders: [],
+  startedAt: new Date().toISOString(),
+  downloaded: [],
+  skipped: [],
+  failed: [],
+  folders: [],
+  courses: [],
 };
 
+const visitedFolders = new Set();
+const processedFiles = new Set();
+
+const sleep = ms =>
+  new Promise(resolve => setTimeout(resolve, ms));
+
 function safeName(name) {
-    return name
-        .replace(/[<>:"/\\|?*\x00-\x1f]/g, "_")
-        .trim();
+  return String(name || "Unnamed")
+    .replace(/[<>:"/\\|?*\x00-\x1f]/g, "_")
+    .replace(/^\.+$/, "_")
+    .trim()
+    .slice(0, 150);
 }
+
+async function exists(filePath) {
+  try {
+    await fs.access(filePath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function saveReport() {
+  report.updatedAt = new Date().toISOString();
+
+  await fs.writeFile(
+    path.join(ARCHIVE_DIR, "archive-report.json"),
+    JSON.stringify(report, null, 2)
+  );
+}
+
+// --------------------------------------------------
+// Discover all courses visible on Canvas All Courses
+// --------------------------------------------------
+
+async function discoverCourses() {
+  console.log("\nDiscovering Canvas courses...");
+
+  await page.goto(`${BASE_URL}/courses`, {
+    waitUntil: "domcontentloaded",
+  });
+
+  await page.locator(
+    'a[href*="/courses/"]'
+  ).first().waitFor({ timeout: 20000 });
+
+  const courses = await page.locator(
+    'a[href*="/courses/"]'
+  ).evaluateAll(links => {
+    const results = [];
+
+    for (const link of links) {
+      const url = new URL(link.href);
+
+      const match = url.pathname.match(
+        /^\/courses\/(\d+)\/?$/
+      );
+
+      if (!match) continue;
+
+      const name = link.textContent?.trim();
+
+      if (!name) continue;
+
+      results.push({
+        id: match[1],
+        name,
+        url: `${url.origin}/courses/${match[1]}`,
+      });
+    }
+
+    return results;
+  });
+
+  const unique = [
+    ...new Map(
+      courses.map(course => [course.id, course])
+    ).values()
+  ];
+
+  await fs.writeFile(
+    path.join(ARCHIVE_DIR, "courses.json"),
+    JSON.stringify(unique, null, 2)
+  );
+
+  console.log(`Found ${unique.length} courses.`);
+
+  for (const course of unique) {
+    console.log(`  ${course.id}: ${course.name}`);
+  }
+
+  return unique;
+}
+
+// --------------------------------------------------
+// Download one Canvas file
+// --------------------------------------------------
 
 async function downloadFile(file, destinationDir) {
-    if (downloadedFiles.has(file.id)) return;
+  if (processedFiles.has(file.id)) return;
 
-    downloadedFiles.add(file.id);
-
+  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     try {
-        const [download] = await Promise.all([
-            page.waitForEvent("download", { timeout: 30000 }),
-            page.evaluate(url => {
-                const a = document.createElement("a");
-                a.href = url;
-                a.click();
-            }, file.url),
-        ]);
+      const [download] = await Promise.all([
+        page.waitForEvent("download", {
+          timeout: 45000,
+        }),
+        page.evaluate(url => {
+          const a = document.createElement("a");
+          a.href = url;
+          a.click();
+        }, file.url),
+      ]);
 
-        const filename = safeName(download.suggestedFilename());
-        const destination = path.join(
-            destinationDir,
-            `${file.id}_${filename}`
-        );
+      const filename = safeName(
+        download.suggestedFilename()
+      );
 
-        try {
-            await fs.access(destination);
-            report.skipped.push(destination);
-            await download.cancel();
-            return;
-        } catch {
-            // Not previously downloaded.
-        }
+      const destination = path.join(
+        destinationDir,
+        `${file.id}_${filename}`
+      );
 
-        await download.saveAs(destination);
-        report.downloaded.push(destination);
+      if (await exists(destination)) {
+        await download.cancel();
 
-        console.log(`Downloaded: ${destination}`);
+        console.log(`Skipping: ${filename}`);
+        report.skipped.push(destination);
+        processedFiles.add(file.id);
+        return;
+      }
+
+      await download.saveAs(destination);
+
+      processedFiles.add(file.id);
+      report.downloaded.push(destination);
+
+      console.log(`Downloaded: ${filename}`);
+
+      await sleep(DOWNLOAD_DELAY_MS);
+      return;
 
     } catch (error) {
-        report.failed.push({
-            file: file.id,
-            error: error.message,
-        });
+      console.error(
+        `Attempt ${attempt}/${MAX_RETRIES} failed for ${file.id}:`,
+        error.message
+      );
 
-        console.error(`Failed: ${file.id}`, error.message);
+      if (attempt < MAX_RETRIES) {
+        await sleep(DOWNLOAD_DELAY_MS * attempt);
+      } else {
+        report.failed.push({
+          type: "file",
+          id: file.id,
+          url: file.url,
+          error: error.message,
+        });
+      }
     }
+  }
 }
+
+// --------------------------------------------------
+// Recursively traverse a Canvas folder
+// --------------------------------------------------
 
 async function scanFolder(folderUrl, localPath, depth = 0) {
-    if (visitedFolders.has(folderUrl)) return;
-    visitedFolders.add(folderUrl);
+  if (visitedFolders.has(folderUrl)) return;
 
-    await fs.mkdir(localPath, { recursive: true });
+  visitedFolders.add(folderUrl);
 
+  await fs.mkdir(localPath, { recursive: true });
+
+  console.log(
+    `${"  ".repeat(depth)}Scanning: ${localPath}`
+  );
+
+  await page.goto(folderUrl, {
+    waitUntil: "domcontentloaded",
+  });
+
+  // Wait for Canvas file browser.
+  await page.locator(
+    ".ef-name-col__link"
+  ).first().waitFor({
+    state: "visible",
+    timeout: 20000,
+  }).catch(() => {
     console.log(
-        `${"  ".repeat(depth)}Scanning: ${localPath}`
+      "No file entries found or folder is empty."
+    );
+  });
+
+  // Discover downloadable files in current folder.
+  const files = await page.locator(
+    'a[href*="/files/"][href*="/download"]'
+  ).evaluateAll(elements =>
+    elements.map(a => ({
+      id: a.href.match(/\/files\/(\d+)/)?.[1],
+      url: a.href,
+    })).filter(f => f.id)
+  );
+
+  const uniqueFiles = [
+    ...new Map(
+      files.map(file => [file.id, file])
+    ).values()
+  ];
+
+  // Discover folders using Canvas file-table links.
+  const folders = await page.locator(
+    'a.ef-name-col__link[href*="/files/folder/"]'
+  ).evaluateAll(elements =>
+    elements.map(a => ({
+      name:
+        a.querySelector(".ef-name-col__text")
+          ?.textContent?.trim() || "Unnamed Folder",
+      url: a.href,
+    }))
+  );
+
+  const uniqueFolders = [
+    ...new Map(
+      folders.map(folder => [folder.url, folder])
+    ).values()
+  ];
+
+  report.folders.push({
+    path: localPath,
+    files: uniqueFiles.length,
+    subfolders: uniqueFolders.length,
+  });
+
+  console.log(
+    `${"  ".repeat(depth)}Found ` +
+    `${uniqueFiles.length} files and ` +
+    `${uniqueFolders.length} subfolders`
+  );
+
+  for (const file of uniqueFiles) {
+    await downloadFile(file, localPath);
+  }
+
+  for (const folder of uniqueFolders) {
+    const childPath = path.join(
+      localPath,
+      safeName(folder.name)
     );
 
-    await page.goto(folderUrl, {
-        waitUntil: "domcontentloaded",
-    });
-
-    await page.locator(
-        ".ef-name-col__link"
-    ).first().waitFor({
-        state: "visible",
-        timeout: 20000,
-    }).catch(() => {
-        console.log(
-            "No visible file entries found; checking folder state."
-        );
-    });
-
-    // Give Canvas time to render its file browser.
-    await page.locator(
-        'a[href*="/files/"]'
-    ).first().waitFor({ timeout: 15000 }).catch(() => { });
-
-    // Capture downloadable files in the current view.
-    const files = await page.locator(
-        'a[href*="/files/"][href*="/download"]'
-    ).evaluateAll(elements =>
-        elements.map(a => ({
-            id: a.href.match(/\/files\/(\d+)/)?.[1],
-            url: a.href,
-        })).filter(item => item.id)
+    await scanFolder(
+      folder.url,
+      childPath,
+      depth + 1
     );
-
-    // Folder links can vary by Canvas version.
-
-    const folders = await page.locator(
-        'a.ef-name-col__link[href*="/files/folder/"]'
-    ).evaluateAll(elements =>
-        elements.map(a => ({
-            name:
-                a.querySelector(".ef-name-col__text")
-                    ?.textContent?.trim() || "Unnamed Folder",
-            url: a.href,
-        }))
-    );
-
-    const uniqueFolders = [
-        ...new Map(
-            folders.map(folder => [folder.url, folder])
-        ).values()
-    ];
-
-    console.log(
-        `Found ${uniqueFolders.length} subfolders`
-    );
-
-
-    console.log(
-        "FOLDER DEBUG:",
-        JSON.stringify(folders, null, 2)
-    );
-
-
-    const uniqueFiles = [
-        ...new Map(files.map(f => [f.id, f])).values()
-    ];
-
-    report.folders.push({
-        path: localPath,
-        files: uniqueFiles.length,
-        folders: uniqueFolders.length,
-    });
-
-    for (const file of uniqueFiles) {
-        await downloadFile(file, localPath);
-    }
-
-    for (const folder of uniqueFolders) {
-        const name = safeName(folder.name);
-
-        await scanFolder(
-            folder.url,
-            path.join(localPath, name),
-            depth + 1
-        );
-    }
+  }
 }
 
+// --------------------------------------------------
+// Main execution
+// --------------------------------------------------
+
+const rl = readline.createInterface({
+  input: process.stdin,
+  output: process.stdout,
+});
+
 try {
-    await page.goto(BASE_URL);
+  await page.goto(BASE_URL);
 
-    const rl = readline.createInterface({
-        input: process.stdin,
-        output: process.stdout,
-    });
+  await rl.question(
+    "\nLog in to UCF Canvas, then press Enter: "
+  );
 
-    await rl.question(
-        "Log in to Canvas, then press Enter: "
+  const courses = await discoverCourses();
+
+  if (courses.length === 0) {
+    throw new Error(
+      "No courses discovered. Check the All Courses page."
+    );
+  }
+
+  if (!DOWNLOAD_ALL) {
+    console.log(
+      "\nDiscovery complete. No files downloaded."
     );
 
-    await scanFolder(FILES_URL, ARCHIVE_DIR);
-
-    rl.close();
-
-    await fs.writeFile(
-        path.join(ARCHIVE_DIR, "archive-report.json"),
-        JSON.stringify(report, null, 2)
+    console.log(
+      "Review courses.json before starting downloads."
     );
+  } else {
+    console.log(
+      `\nStarting archive of ${courses.length} courses.`
+    );
+
+    for (const course of courses) {
+      console.log(
+        `\n====================================\n` +
+        `Course: ${course.name}\n` +
+        `ID: ${course.id}\n` +
+        `====================================`
+      );
+
+      visitedFolders.clear();
+      processedFiles.clear();
+
+      const courseDir = path.join(
+        ARCHIVE_DIR,
+        `${course.id}_${safeName(course.name)}`
+      );
+
+      const filesUrl =
+        `${BASE_URL}/courses/${course.id}/files`;
+
+      try {
+        await scanFolder(filesUrl, courseDir);
+
+        report.courses.push({
+          id: course.id,
+          name: course.name,
+          status: "processed",
+        });
+
+      } catch (error) {
+        console.error(
+          `Course failed: ${course.name}`,
+          error.message
+        );
+
+        report.failed.push({
+          type: "course",
+          id: course.id,
+          name: course.name,
+          error: error.message,
+        });
+
+        report.courses.push({
+          id: course.id,
+          name: course.name,
+          status: "failed",
+        });
+      }
+
+      await saveReport();
+      await sleep(DOWNLOAD_DELAY_MS);
+    }
 
     console.log("\nArchive complete.");
-    console.log(`Downloaded: ${report.downloaded.length}`);
-    console.log(`Skipped: ${report.skipped.length}`);
-    console.log(`Failed: ${report.failed.length}`);
-    console.log(`Folders scanned: ${report.folders.length}`);
+    console.log(
+      `Downloaded: ${report.downloaded.length}`
+    );
+    console.log(
+      `Skipped: ${report.skipped.length}`
+    );
+    console.log(
+      `Failed: ${report.failed.length}`
+    );
+    console.log(
+      `Folders scanned: ${report.folders.length}`
+    );
+  }
+
+} catch (error) {
+  console.error("Fatal error:", error.message);
+  process.exitCode = 1;
 
 } finally {
-    await browser.close();
+  await saveReport();
+  rl.close();
+  await browser.close();
 }
